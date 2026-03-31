@@ -142,9 +142,9 @@ class HybridSearch:
             access_count = r.get("access_count", 0) or 0
             access_boost = math.log1p(access_count) / 10  # normalized: log(11)/10 ≈ 0.24 at 10 accesses
 
-            # Blend: (1 - tw) * relevance + tw * (temporal + access_boost)
+            # Blend: (1 - tw) * relevance + tw * min(temporal + access_boost, 1.0)
             tw = self.temporal_weight
-            r["score"] = (1 - tw) * r["score"] + tw * (temporal_score + access_boost)
+            r["score"] = (1 - tw) * r["score"] + tw * min(temporal_score + access_boost, 1.0)
 
     def _build_filter_clause(
         self, filters: dict, table_alias: str = "m"
@@ -275,7 +275,11 @@ class HybridSearch:
         else:
             fr_sims = cos_sims
 
-        # Graduated ramp: blend cosine → Fisher-Rao based on access count
+        # Graduated ramp: blend cosine → Fisher-Rao based on access count.
+        # Note: this creates an intentional feedback loop — frequently accessed
+        # memories get Fisher-Rao scoring (more discriminative), which may change
+        # their ranking, affecting future access patterns. This is by design:
+        # well-exercised memories earn more precise similarity scoring.
         for i, mem in enumerate(memories):
             access_count = mem.get("access_count", 0) or 0
             alpha = min(access_count / 10.0, 1.0)

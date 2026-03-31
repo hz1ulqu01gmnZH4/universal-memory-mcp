@@ -39,9 +39,15 @@ class MemoryNotFoundError(Exception):
 class MemoryStore:
     """SQLite-backed memory storage with FTS5 and optimistic locking."""
 
-    def __init__(self, db_path: str, embedding_manager: Optional[Any] = None):
+    def __init__(
+        self,
+        db_path: str,
+        embedding_manager: Optional[Any] = None,
+        contradiction_threshold: float = 0.92,
+    ):
         self.db_path = db_path
         self.embedding_manager = embedding_manager
+        self.contradiction_threshold = contradiction_threshold
         self._ensure_db_dir()
         self._init_schema()
 
@@ -61,9 +67,25 @@ class MemoryStore:
         conn = self._connect()
         try:
             conn.executescript(schema_sql)
+            self._migrate(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns that may be missing from older schema versions."""
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        migrations = [
+            ("embedding_variance", "ALTER TABLE memories ADD COLUMN embedding_variance BLOB"),
+            ("access_count", "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
+            ("last_accessed_at", "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in existing:
+                conn.execute(sql)
+                logger.info("Migrated: added column '%s' to memories", col_name)
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -91,13 +113,14 @@ class MemoryStore:
         metadata_json = json.dumps(metadata) if metadata else None
 
         embedding_blob = None
+        embedding_array = None
         variance_blob = None
         embedding_computed = False
         if compute_embedding and self.embedding_manager is not None:
             try:
-                emb = self.embedding_manager.encode([content])[0]
-                embedding_blob = self.embedding_manager.serialize_embedding(emb)
-                variance = self.embedding_manager.estimate_variance(emb)
+                embedding_array = self.embedding_manager.encode([content])[0]
+                embedding_blob = self.embedding_manager.serialize_embedding(embedding_array)
+                variance = self.embedding_manager.estimate_variance(embedding_array)
                 variance_blob = self.embedding_manager.serialize_variance(variance)
                 embedding_computed = True
             except Exception as e:
@@ -121,13 +144,13 @@ class MemoryStore:
 
         # Detect contradictions with existing memories
         contradictions = []
-        if embedding_computed and self.embedding_manager is not None:
-            emb = self.embedding_manager.deserialize_embedding(embedding_blob)
+        if embedding_computed and embedding_array is not None:
             contradictions = self._detect_contradictions(
                 memory_id=memory_id,
-                embedding=emb,
+                embedding=embedding_array,
                 memory_type=memory_type,
                 agent_id=agent_id,
+                similarity_threshold=self.contradiction_threshold,
             )
 
         result = {

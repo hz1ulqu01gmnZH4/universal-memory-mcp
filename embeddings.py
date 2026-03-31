@@ -57,10 +57,11 @@ class EmbeddingManager:
 
     @staticmethod
     def estimate_variance(embedding: np.ndarray) -> np.ndarray:
-        """Estimate per-dimension variance from signal magnitude.
+        """Estimate per-dimension variance using a magnitude-based proxy.
 
         High-magnitude dimensions are assumed to be high-confidence (low variance).
-        Based on Fisher information approach from SLM-V3 paper.
+        This is a heuristic approximation inspired by SLM-V3, not true Fisher
+        information (which would require gradient computation over the model).
 
         Returns:
             Shape (d,) array of variance estimates with dtype float32.
