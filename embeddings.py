@@ -55,6 +55,56 @@ class EmbeddingManager:
         """
         return corpus_embeddings @ query_embedding
 
+    @staticmethod
+    def estimate_variance(embedding: np.ndarray) -> np.ndarray:
+        """Estimate per-dimension variance from signal magnitude.
+
+        High-magnitude dimensions are assumed to be high-confidence (low variance).
+        Based on Fisher information approach from SLM-V3 paper.
+
+        Returns:
+            Shape (d,) array of variance estimates with dtype float32.
+        """
+        sigma_min, sigma_max = 0.01, 1.0
+        abs_emb = np.abs(embedding)
+        max_val = np.maximum(abs_emb.max(), 1e-9)
+        variance = sigma_max - (sigma_max - sigma_min) * (abs_emb / max_val)
+        return variance.astype(np.float32) + 1e-9
+
+    @staticmethod
+    def fisher_rao_similarity(
+        query_embedding: np.ndarray,
+        corpus_embeddings: np.ndarray,
+        corpus_variances: np.ndarray,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
+        """Fisher-information-weighted similarity.
+
+        Dimensions with low variance (high confidence) contribute more to the
+        distance. This outperforms cosine similarity by +7.2pp on complex queries
+        (SLM-V3 ablation study).
+
+        Args:
+            query_embedding: Shape (d,) query vector.
+            corpus_embeddings: Shape (n, d) corpus matrix.
+            corpus_variances: Shape (n, d) per-memory variance estimates.
+            temperature: Scaling factor for the exponential.
+
+        Returns:
+            Shape (n,) array of similarity scores in [0, 1].
+        """
+        diff = corpus_embeddings - query_embedding  # (n, d)
+        weighted_dist = np.sum(diff ** 2 / corpus_variances, axis=1)  # (n,)
+        return np.exp(-weighted_dist / temperature)
+
+    def serialize_variance(self, variance: np.ndarray) -> bytes:
+        """Convert variance vector to bytes for SQLite BLOB storage."""
+        return variance.astype(np.float32).tobytes()
+
+    def deserialize_variance(self, blob: bytes) -> np.ndarray:
+        """Convert BLOB bytes back to variance array."""
+        return np.frombuffer(blob, dtype=np.float32).reshape(self.dimension)
+
 
 class TransformersEmbeddingManager(EmbeddingManager):
     """Embedding manager using HuggingFace transformers (in-process).

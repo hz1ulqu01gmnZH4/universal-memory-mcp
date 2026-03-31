@@ -32,6 +32,8 @@ class MemoryConfig(BaseSettings):
     enable_embeddings: bool = True
     keyword_weight: float = 0.4
     semantic_weight: float = 0.6
+    temporal_decay_lambda: float = 0.01
+    temporal_weight: float = 0.1
 
     model_config = {"env_prefix": "MEMORY_"}
 
@@ -55,6 +57,8 @@ searcher = HybridSearch(
     embedding_manager=embedding_manager,
     keyword_weight=config.keyword_weight,
     semantic_weight=config.semantic_weight,
+    temporal_decay_lambda=config.temporal_decay_lambda,
+    temporal_weight=config.temporal_weight,
 )
 
 # --- MCP Server ---

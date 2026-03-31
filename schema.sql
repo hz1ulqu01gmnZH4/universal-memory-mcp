@@ -12,12 +12,15 @@ CREATE TABLE IF NOT EXISTS memories (
     memory_type TEXT NOT NULL CHECK(memory_type IN ('episodic', 'semantic', 'procedural')),
     content TEXT NOT NULL,
     embedding BLOB,
+    embedding_variance BLOB,
     metadata TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_by TEXT,
     version INTEGER NOT NULL DEFAULT 1,
-    importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0.0 AND importance <= 1.0)
+    importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0.0 AND importance <= 1.0),
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TEXT
 );
 
 -- FTS5 virtual table for keyword search (porter stemming + unicode)
