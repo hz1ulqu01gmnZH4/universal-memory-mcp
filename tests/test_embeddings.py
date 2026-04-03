@@ -116,6 +116,63 @@ def mock_llama_server():
     server.shutdown()
 
 
+class TestVarianceAndFisherRao:
+    def test_estimate_variance_shape(self):
+        emb = np.array([0.5, -0.3, 0.8, 0.0], dtype=np.float32)
+        var = EmbeddingManager.estimate_variance(emb)
+        assert var.shape == emb.shape
+        assert var.dtype == np.float32
+
+    def test_estimate_variance_high_magnitude_low_variance(self):
+        emb = np.array([1.0, 0.0, 0.5], dtype=np.float32)
+        var = EmbeddingManager.estimate_variance(emb)
+        # Highest magnitude dimension should have lowest variance
+        assert var[0] < var[2] < var[1]
+
+    def test_estimate_variance_all_positive(self):
+        emb = np.random.randn(384).astype(np.float32)
+        var = EmbeddingManager.estimate_variance(emb)
+        assert (var > 0).all()
+
+    def test_fisher_rao_similarity_identical(self):
+        q = np.array([0.5, 0.3, 0.8], dtype=np.float32)
+        corpus = q.reshape(1, -1)
+        var = np.ones((1, 3), dtype=np.float32) * 0.5
+        sims = EmbeddingManager.fisher_rao_similarity(q, corpus, var)
+        assert sims[0] == pytest.approx(1.0)
+
+    def test_fisher_rao_similarity_distant(self):
+        q = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        corpus = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
+        var = np.ones((1, 3), dtype=np.float32) * 0.1
+        sims = EmbeddingManager.fisher_rao_similarity(q, corpus, var)
+        assert sims[0] < 0.01  # very distant with low variance
+
+    def test_fisher_rao_low_variance_more_discriminative(self):
+        q = np.array([1.0, 0.0], dtype=np.float32)
+        corpus = np.array([[0.9, 0.1]], dtype=np.float32)
+        # Low variance = more discriminative (smaller score for same distance)
+        low_var = np.ones((1, 2), dtype=np.float32) * 0.01
+        high_var = np.ones((1, 2), dtype=np.float32) * 1.0
+        sim_low = EmbeddingManager.fisher_rao_similarity(q, corpus, low_var)[0]
+        sim_high = EmbeddingManager.fisher_rao_similarity(q, corpus, high_var)[0]
+        assert sim_low < sim_high
+
+    def test_variance_serialize_roundtrip(self):
+        mgr = EmbeddingManager(dimension=4)
+        var = np.array([0.1, 0.5, 0.3, 0.9], dtype=np.float32)
+        blob = mgr.serialize_variance(var)
+        restored = mgr.deserialize_variance(blob)
+        np.testing.assert_array_almost_equal(var, restored)
+
+    def test_fisher_rao_empty_corpus(self):
+        q = np.array([1.0, 0.0], dtype=np.float32)
+        corpus = np.empty((0, 2), dtype=np.float32)
+        var = np.empty((0, 2), dtype=np.float32)
+        sims = EmbeddingManager.fisher_rao_similarity(q, corpus, var)
+        assert len(sims) == 0
+
+
 class TestLlamaServerBackend:
     def test_encode_returns_normalized(self, mock_llama_server):
         mgr = LlamaServerEmbeddingManager(

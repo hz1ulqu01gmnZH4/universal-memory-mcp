@@ -237,6 +237,97 @@ class TestSessions:
             store.restore_session(sess["session_id"])
 
 
+class TestSchemaMigration:
+    def test_migration_adds_missing_columns(self, tmp_path):
+        """Simulate an old DB without new columns — migration should add them."""
+        import sqlite3
+        db_path = str(tmp_path / "old.db")
+
+        # Create a minimal old-schema DB without new columns
+        conn = sqlite3.connect(db_path)
+        conn.execute("""CREATE TABLE memories (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT,
+            session_id TEXT,
+            memory_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding BLOB,
+            metadata TEXT,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            updated_by TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            importance REAL NOT NULL DEFAULT 0.5
+        )""")
+        conn.commit()
+        conn.close()
+
+        # MemoryStore should migrate — not crash
+        store = MemoryStore(db_path=db_path, embedding_manager=None)
+
+        # Verify new columns exist by inserting/reading
+        r = store.store_memory(content="test", memory_type="semantic", compute_embedding=False)
+        mem = store.get_memory(r["memory_id"])
+        assert mem["access_count"] == 1  # get_memory bumps from 0 to 1
+        assert mem["last_accessed_at"] is not None
+
+
+class TestContradictionDetection:
+    def test_no_contradictions_without_embeddings(self, store):
+        r = store.store_memory(content="fact A", memory_type="semantic", compute_embedding=False)
+        assert "contradictions" not in r
+
+    def test_contradiction_detection_with_mock_embeddings(self, tmp_path):
+        """Test contradiction detection using a mock embedding manager."""
+        import numpy as np
+        from unittest.mock import MagicMock
+
+        mock_emb = MagicMock()
+        mock_emb.dimension = 4
+        # All memories get nearly identical embeddings → should trigger contradiction
+        mock_emb.encode.return_value = np.array([[0.5, 0.5, 0.5, 0.5]], dtype=np.float32)
+        mock_emb.serialize_embedding.side_effect = lambda e: e.astype(np.float32).tobytes()
+        mock_emb.deserialize_embedding.side_effect = lambda b: np.frombuffer(b, dtype=np.float32)
+        mock_emb.estimate_variance.return_value = np.array([0.1, 0.1, 0.1, 0.1], dtype=np.float32)
+        mock_emb.serialize_variance.side_effect = lambda v: v.astype(np.float32).tobytes()
+        mock_emb.cosine_similarity.side_effect = lambda q, c: c @ q
+
+        db_path = str(tmp_path / "contra.db")
+        store = MemoryStore(db_path=db_path, embedding_manager=mock_emb, contradiction_threshold=0.9)
+
+        # Store first memory
+        r1 = store.store_memory(content="The sky is blue", memory_type="semantic")
+        assert "contradictions" not in r1  # no existing memories to contradict
+
+        # Store second memory with same embedding → contradiction
+        r2 = store.store_memory(content="The sky is green", memory_type="semantic")
+        assert "contradictions" in r2
+        assert len(r2["contradictions"]) == 1
+        assert r2["contradictions"][0]["memory_id"] == r1["memory_id"]
+        assert r2["contradictions"][0]["similarity"] >= 0.9
+
+    def test_no_contradiction_across_types(self, tmp_path):
+        """Memories of different types should not trigger contradictions."""
+        import numpy as np
+        from unittest.mock import MagicMock
+
+        mock_emb = MagicMock()
+        mock_emb.dimension = 4
+        mock_emb.encode.return_value = np.array([[0.5, 0.5, 0.5, 0.5]], dtype=np.float32)
+        mock_emb.serialize_embedding.side_effect = lambda e: e.astype(np.float32).tobytes()
+        mock_emb.deserialize_embedding.side_effect = lambda b: np.frombuffer(b, dtype=np.float32)
+        mock_emb.estimate_variance.return_value = np.array([0.1, 0.1, 0.1, 0.1], dtype=np.float32)
+        mock_emb.serialize_variance.side_effect = lambda v: v.astype(np.float32).tobytes()
+        mock_emb.cosine_similarity.side_effect = lambda q, c: c @ q
+
+        db_path = str(tmp_path / "cross.db")
+        store = MemoryStore(db_path=db_path, embedding_manager=mock_emb)
+
+        store.store_memory(content="fact", memory_type="semantic")
+        r2 = store.store_memory(content="procedure", memory_type="procedural")
+        assert "contradictions" not in r2
+
+
 class TestStats:
     def test_empty_stats(self, store):
         stats = store.get_stats()

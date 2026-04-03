@@ -32,6 +32,9 @@ class MemoryConfig(BaseSettings):
     enable_embeddings: bool = True
     keyword_weight: float = 0.4
     semantic_weight: float = 0.6
+    temporal_decay_lambda: float = 0.01
+    temporal_weight: float = 0.1
+    contradiction_threshold: float = 0.92
 
     model_config = {"env_prefix": "MEMORY_"}
 
@@ -49,12 +52,18 @@ if config.enable_embeddings:
         server_url=config.llama_server_url,
     )
 
-store = MemoryStore(db_path=config.database_path, embedding_manager=embedding_manager)
+store = MemoryStore(
+    db_path=config.database_path,
+    embedding_manager=embedding_manager,
+    contradiction_threshold=config.contradiction_threshold,
+)
 searcher = HybridSearch(
     db_path=config.database_path,
     embedding_manager=embedding_manager,
     keyword_weight=config.keyword_weight,
     semantic_weight=config.semantic_weight,
+    temporal_decay_lambda=config.temporal_decay_lambda,
+    temporal_weight=config.temporal_weight,
 )
 
 # --- MCP Server ---

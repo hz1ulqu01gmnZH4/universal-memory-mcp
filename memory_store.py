@@ -1,11 +1,16 @@
 """Core memory storage operations with SQLite backend and optimistic locking."""
 
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
@@ -34,9 +39,15 @@ class MemoryNotFoundError(Exception):
 class MemoryStore:
     """SQLite-backed memory storage with FTS5 and optimistic locking."""
 
-    def __init__(self, db_path: str, embedding_manager: Optional[Any] = None):
+    def __init__(
+        self,
+        db_path: str,
+        embedding_manager: Optional[Any] = None,
+        contradiction_threshold: float = 0.92,
+    ):
         self.db_path = db_path
         self.embedding_manager = embedding_manager
+        self.contradiction_threshold = contradiction_threshold
         self._ensure_db_dir()
         self._init_schema()
 
@@ -44,10 +55,11 @@ class MemoryStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _init_schema(self) -> None:
@@ -55,9 +67,25 @@ class MemoryStore:
         conn = self._connect()
         try:
             conn.executescript(schema_sql)
+            self._migrate(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns that may be missing from older schema versions."""
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        migrations = [
+            ("embedding_variance", "ALTER TABLE memories ADD COLUMN embedding_variance BLOB"),
+            ("access_count", "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
+            ("last_accessed_at", "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in existing:
+                conn.execute(sql)
+                logger.info("Migrated: added column '%s' to memories", col_name)
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -85,11 +113,15 @@ class MemoryStore:
         metadata_json = json.dumps(metadata) if metadata else None
 
         embedding_blob = None
+        embedding_array = None
+        variance_blob = None
         embedding_computed = False
         if compute_embedding and self.embedding_manager is not None:
             try:
-                emb = self.embedding_manager.encode([content])[0]
-                embedding_blob = self.embedding_manager.serialize_embedding(emb)
+                embedding_array = self.embedding_manager.encode([content])[0]
+                embedding_blob = self.embedding_manager.serialize_embedding(embedding_array)
+                variance = self.embedding_manager.estimate_variance(embedding_array)
+                variance_blob = self.embedding_manager.serialize_variance(variance)
                 embedding_computed = True
             except Exception as e:
                 raise RuntimeError(f"Embedding computation failed: {e}") from e
@@ -99,22 +131,36 @@ class MemoryStore:
             conn.execute(
                 """INSERT INTO memories
                    (id, agent_id, session_id, memory_type, content, embedding,
-                    metadata, created_at, updated_at, version, importance)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                    embedding_variance, metadata, created_at, updated_at, version, importance)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                 (
                     memory_id, agent_id, session_id, memory_type, content,
-                    embedding_blob, metadata_json, now, now, importance,
+                    embedding_blob, variance_blob, metadata_json, now, now, importance,
                 ),
             )
             conn.commit()
         finally:
             conn.close()
 
-        return {
+        # Detect contradictions with existing memories
+        contradictions = []
+        if embedding_computed and embedding_array is not None:
+            contradictions = self._detect_contradictions(
+                memory_id=memory_id,
+                embedding=embedding_array,
+                memory_type=memory_type,
+                agent_id=agent_id,
+                similarity_threshold=self.contradiction_threshold,
+            )
+
+        result = {
             "memory_id": memory_id,
             "created_at": now,
             "embedding_computed": embedding_computed,
         }
+        if contradictions:
+            result["contradictions"] = contradictions
+        return result
 
     def get_memory(self, memory_id: str) -> dict:
         """Get a single memory by ID. Raises MemoryNotFoundError if missing."""
@@ -123,17 +169,27 @@ class MemoryStore:
             row = conn.execute(
                 """SELECT id, agent_id, session_id, memory_type, content,
                           metadata, created_at, updated_at, updated_by,
-                          version, importance
+                          version, importance, access_count, last_accessed_at
                    FROM memories WHERE id = ?""",
                 (memory_id,),
             ).fetchone()
+
+            if row is None:
+                raise MemoryNotFoundError(memory_id)
+
+            # Bump access tracking
+            now = self._now_iso()
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
+                (now, memory_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 
-        if row is None:
-            raise MemoryNotFoundError(memory_id)
-
         result = dict(row)
+        result["access_count"] = result["access_count"] + 1
+        result["last_accessed_at"] = now
         if result["metadata"]:
             result["metadata"] = json.loads(result["metadata"])
         return result
@@ -179,6 +235,10 @@ class MemoryStore:
                         embedding_blob = self.embedding_manager.serialize_embedding(emb)
                         updates.append("embedding = ?")
                         params.append(embedding_blob)
+                        variance = self.embedding_manager.estimate_variance(emb)
+                        variance_blob = self.embedding_manager.serialize_variance(variance)
+                        updates.append("embedding_variance = ?")
+                        params.append(variance_blob)
                     except Exception as e:
                         raise RuntimeError(f"Embedding computation failed: {e}") from e
 
@@ -248,6 +308,86 @@ class MemoryStore:
             conn.close()
 
         return {"memory_id": memory_id, "status": "deleted"}
+
+    # --- Contradiction detection ---
+
+    def _detect_contradictions(
+        self,
+        memory_id: str,
+        embedding: np.ndarray,
+        memory_type: str,
+        agent_id: Optional[str],
+        similarity_threshold: float = 0.85,
+        max_candidates: int = 50,
+    ) -> list[dict]:
+        """Detect potential contradictions with existing memories.
+
+        Finds memories with high semantic similarity to the new memory.
+        High similarity + same type suggests potential contradiction (updated fact,
+        revised procedure, etc.). Auto-creates 'contradicts' links.
+
+        Returns list of contradiction info dicts.
+        """
+        if self.embedding_manager is None:
+            return []
+
+        conn = self._connect()
+        try:
+            # Fetch candidate memories with embeddings (same type, optionally same agent)
+            params: list = []
+            agent_filter = ""
+            if agent_id is not None:
+                agent_filter = " AND agent_id = ?"
+                params.append(agent_id)
+
+            rows = conn.execute(
+                f"""SELECT id, content, embedding, memory_type
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND id != ?
+                      AND memory_type = ?{agent_filter}
+                    ORDER BY created_at DESC LIMIT ?""",
+                [memory_id, memory_type] + params + [max_candidates],
+            ).fetchall()
+
+            if not rows:
+                return []
+
+            # Compute similarities
+            corpus = np.array([
+                self.embedding_manager.deserialize_embedding(r["embedding"])
+                for r in rows
+            ])
+            similarities = self.embedding_manager.cosine_similarity(embedding, corpus)
+
+            # Find high-similarity candidates
+            contradictions = []
+            for i, row in enumerate(rows):
+                sim = float(similarities[i])
+                if sim >= similarity_threshold:
+                    # Auto-create contradicts link (new supersedes old)
+                    try:
+                        self.link_memories(
+                            from_memory_id=memory_id,
+                            to_memory_id=row["id"],
+                            relation_type="contradicts",
+                            strength=sim,
+                        )
+                        contradictions.append({
+                            "memory_id": row["id"],
+                            "similarity": round(sim, 4),
+                            "content_preview": row["content"][:100],
+                        })
+                    except (ValueError, MemoryNotFoundError):
+                        pass  # duplicate link or deleted memory — skip
+        finally:
+            conn.close()
+
+        if contradictions:
+            logger.info(
+                "Detected %d potential contradiction(s) for memory %s",
+                len(contradictions), memory_id,
+            )
+        return contradictions
 
     # --- Link operations ---
 
