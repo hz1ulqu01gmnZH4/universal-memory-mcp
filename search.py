@@ -343,5 +343,5 @@ class HybridSearch:
         words = query.strip().split()
         if not words:
             return ""
-        # Quote each token to avoid FTS5 syntax issues
-        return " ".join(f'"{w}"' for w in words)
+        # Strip double quotes from tokens, then wrap in quotes to avoid FTS5 syntax issues
+        return " ".join(f'"{w.replace(chr(34), "")}"' for w in words)

@@ -99,6 +99,21 @@ class TestKeywordSearch:
         assert results[0]["session_id"] == "lit-review-1"
 
 
+class TestFtsQuerySanitization:
+    def test_query_with_double_quotes(self, searcher):
+        # Should not raise OperationalError
+        results = searcher.search('test"quote', mode="keyword")
+        assert isinstance(results, list)
+
+    def test_query_with_only_quotes(self, searcher):
+        results = searcher.search('""', mode="keyword")
+        assert results == []
+
+    def test_query_with_embedded_quotes(self, searcher):
+        results = searcher.search('she said "hello" today', mode="keyword")
+        assert isinstance(results, list)
+
+
 class TestAccessTracking:
     def test_search_bumps_access_count(self, populated_store):
         searcher = HybridSearch(db_path=populated_store, embedding_manager=None)
