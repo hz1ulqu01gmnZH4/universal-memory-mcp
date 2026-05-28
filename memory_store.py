@@ -81,11 +81,14 @@ class MemoryStore:
             ("embedding_variance", "ALTER TABLE memories ADD COLUMN embedding_variance BLOB"),
             ("access_count", "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
             ("last_accessed_at", "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT"),
+            ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT REFERENCES memories(id) ON DELETE SET NULL"),
         ]
         for col_name, sql in migrations:
             if col_name not in existing:
                 conn.execute(sql)
                 logger.info("Migrated: added column '%s' to memories", col_name)
+        # Index is created here (not schema.sql) so it runs after the column migration
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by)")
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -142,24 +145,31 @@ class MemoryStore:
         finally:
             conn.close()
 
-        # Detect contradictions with existing memories
-        contradictions = []
-        if embedding_computed and embedding_array is not None:
-            contradictions = self._detect_contradictions(
-                memory_id=memory_id,
-                embedding=embedding_array,
-                memory_type=memory_type,
-                agent_id=agent_id,
-                similarity_threshold=self.contradiction_threshold,
-            )
+        # Detect contradictions with existing memories (Fix 3: non-fatal — write always succeeds)
+        contradiction_info: Optional[dict] = None
+        if embedding_computed and embedding_array is not None and memory_type == "semantic":
+            try:
+                contradiction_info = self._detect_contradictions(
+                    memory_id=memory_id,
+                    content=content,
+                    embedding=embedding_array,
+                    agent_id=agent_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Contradiction detection failed for %s; write succeeded", memory_id, exc_info=True
+                )
 
-        result = {
+        result: dict[str, Any] = {
             "memory_id": memory_id,
             "created_at": now,
             "embedding_computed": embedding_computed,
         }
-        if contradictions:
-            result["contradictions"] = contradictions
+        if contradiction_info is not None:
+            result["contradiction_check"] = contradiction_info
+            # Backward compat: keep old 'contradictions' key for callers checking it
+            if contradiction_info["hot"]:
+                result["contradictions"] = contradiction_info["hot"]
         return result
 
     def get_memory(self, memory_id: str) -> dict:
@@ -311,83 +321,249 @@ class MemoryStore:
 
     # --- Contradiction detection ---
 
+    @staticmethod
+    def _sanitize_fts_query(query: str) -> str:
+        """Sanitize text for FTS5 MATCH. Wraps each word in quotes, caps at 20 tokens."""
+        words = query.strip().split()[:20]
+        if not words:
+            return ""
+        return " ".join(f'"{w.replace(chr(34), "")}"' for w in words)
+
+    def _fetch_embedding_candidates(
+        self,
+        conn: sqlite3.Connection,
+        memory_id: str,
+        memory_type: str,
+        agent_id: Optional[str],
+        limit: int,
+    ) -> list[dict]:
+        """Pool A: same-agent semantic memories with embeddings."""
+        params: list[Any] = [memory_id, memory_type]
+        agent_filter = ""
+        if agent_id is not None:
+            agent_filter = " AND agent_id = ?"
+            params.append(agent_id)
+        params.append(limit)
+
+        rows = conn.execute(
+            f"""SELECT id, content, embedding, memory_type, version, agent_id
+                FROM memories
+                WHERE embedding IS NOT NULL AND id != ?
+                  AND memory_type = ?{agent_filter}
+                ORDER BY created_at DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _fetch_cross_agent_candidates(
+        self,
+        conn: sqlite3.Connection,
+        memory_id: str,
+        content: str,
+        memory_type: str,
+        agent_id: str,
+        limit: int,
+    ) -> list[dict]:
+        """Pool B: cross-agent memories filtered by FTS5 topical relevance (Fix 4).
+
+        FTS5 pre-filters to topically related memories before embedding scoring,
+        avoiding the recency-order bias of a plain ORDER BY created_at DESC.
+        """
+        safe_query = self._sanitize_fts_query(content[:500])
+        if not safe_query:
+            return []
+
+        rows = conn.execute(
+            """SELECT m.id, m.content, m.embedding, m.memory_type, m.version, m.agent_id
+               FROM memories_fts fts
+               JOIN memories m ON m.rowid = fts.rowid
+               WHERE fts.content MATCH ?
+                 AND (m.agent_id != ? OR m.agent_id IS NULL)
+                 AND m.memory_type = ?
+                 AND m.id != ?
+                 AND m.embedding IS NOT NULL
+               LIMIT ?""",
+            [safe_query, agent_id, memory_type, memory_id, limit],
+        ).fetchall()
+
+        result = [dict(r) for r in rows]
+        for r in result:
+            r["_cross_agent"] = True
+        return result
+
     def _detect_contradictions(
         self,
         memory_id: str,
+        content: str,
         embedding: np.ndarray,
-        memory_type: str,
         agent_id: Optional[str],
-        similarity_threshold: float = 0.85,
-        max_candidates: int = 50,
-    ) -> list[dict]:
-        """Detect potential contradictions with existing memories.
+        hot_threshold: float = 0.90,
+        warm_threshold: float = 0.75,
+        max_candidates: int = 100,
+    ) -> dict:
+        """Detect potential contradictions for a newly stored semantic memory.
 
-        Finds memories with high semantic similarity to the new memory.
-        High similarity + same type suggests potential contradiction (updated fact,
-        revised procedure, etc.). Auto-creates 'contradicts' links.
+        Two-threshold approach (Fix 9):
+        - Hot zone (>= hot_threshold): auto-creates 'contradicts' link.
+        - Warm zone (warm_threshold..hot_threshold): surfaces candidates without
+          auto-linking; reserved for future LLM resolver.
 
-        Returns list of contradiction info dicts.
+        Two candidate pools (Fix 4):
+        - Pool A: same agent_id, recency-ordered.
+        - Pool B: cross-agent, FTS5 topical pre-filter to avoid recency bias.
+
+        Cross-agent entries are tagged so callers can enforce the no-UPDATE_IN_PLACE
+        guard (Fix 5) when an LLM resolver is added.
+
+        Returns dict with 'hot', 'warm', and 'llm_invoked' keys.
         """
         if self.embedding_manager is None:
-            return []
+            return {"hot": [], "warm": [], "llm_invoked": False}
+
+        hot: list[dict] = []
+        warm: list[dict] = []
 
         conn = self._connect()
         try:
-            # Fetch candidate memories with embeddings (same type, optionally same agent)
-            params: list = []
-            agent_filter = ""
+            pool_a = self._fetch_embedding_candidates(
+                conn, memory_id, "semantic", agent_id, max_candidates
+            )
+            pool_b: list[dict] = []
             if agent_id is not None:
-                agent_filter = " AND agent_id = ?"
-                params.append(agent_id)
-
-            rows = conn.execute(
-                f"""SELECT id, content, embedding, memory_type
-                    FROM memories
-                    WHERE embedding IS NOT NULL AND id != ?
-                      AND memory_type = ?{agent_filter}
-                    ORDER BY created_at DESC LIMIT ?""",
-                [memory_id, memory_type] + params + [max_candidates],
-            ).fetchall()
-
-            if not rows:
-                return []
-
-            # Compute similarities
-            corpus = np.array([
-                self.embedding_manager.deserialize_embedding(r["embedding"])
-                for r in rows
-            ])
-            similarities = self.embedding_manager.cosine_similarity(embedding, corpus)
-
-            # Find high-similarity candidates
-            contradictions = []
-            for i, row in enumerate(rows):
-                sim = float(similarities[i])
-                if sim >= similarity_threshold:
-                    # Auto-create contradicts link (new supersedes old)
-                    try:
-                        self.link_memories(
-                            from_memory_id=memory_id,
-                            to_memory_id=row["id"],
-                            relation_type="contradicts",
-                            strength=sim,
-                        )
-                        contradictions.append({
-                            "memory_id": row["id"],
-                            "similarity": round(sim, 4),
-                            "content_preview": row["content"][:100],
-                        })
-                    except (ValueError, MemoryNotFoundError):
-                        pass  # duplicate link or deleted memory — skip
+                pool_b = self._fetch_cross_agent_candidates(
+                    conn, memory_id, content, "semantic", agent_id, max_candidates // 2
+                )
         finally:
             conn.close()
 
-        if contradictions:
-            logger.info(
-                "Detected %d potential contradiction(s) for memory %s",
-                len(contradictions), memory_id,
+        all_candidates = pool_a + pool_b
+        if not all_candidates:
+            return {"hot": [], "warm": [], "llm_invoked": False}
+
+        corpus = np.array([
+            self.embedding_manager.deserialize_embedding(r["embedding"])
+            for r in all_candidates
+        ])
+        similarities = self.embedding_manager.cosine_similarity(embedding, corpus)
+
+        for i, row in enumerate(all_candidates):
+            sim = float(similarities[i])
+            is_cross_agent = row.get("_cross_agent", False)
+
+            if sim >= hot_threshold:
+                # Fix 5: cross-agent guard — record the flag so a future LLM resolver
+                # can enforce that UPDATE_IN_PLACE is never applied to another agent's memory.
+                # The auto-detector only creates LINK_CONTRADICTS regardless.
+                try:
+                    self.link_memories(
+                        from_memory_id=memory_id,
+                        to_memory_id=row["id"],
+                        relation_type="contradicts",
+                        strength=sim,
+                        created_by="contradiction_detector",
+                    )
+                    hot.append({
+                        "memory_id": row["id"],
+                        "similarity": round(sim, 4),
+                        "content_preview": row["content"][:100],
+                        "version": row["version"],  # Fix 1: version for future UPDATE_IN_PLACE
+                        "cross_agent": is_cross_agent,
+                        "action": "LINK_CONTRADICTS",
+                    })
+                except (ValueError, MemoryNotFoundError):
+                    pass  # duplicate link or deleted memory — skip
+
+            elif sim >= warm_threshold:
+                # Fix 9: warm zone — surface as candidate, no auto-link (COEXIST default)
+                warm.append({
+                    "memory_id": row["id"],
+                    "similarity": round(sim, 4),
+                    "content_preview": row["content"][:100],
+                    "version": row["version"],  # Fix 1: version for future UPDATE_IN_PLACE
+                    "cross_agent": is_cross_agent,
+                    "action": "COEXIST",
+                })
+
+        if hot:
+            logger.info("Detected %d hot contradiction(s) for memory %s", len(hot), memory_id)
+        if warm:
+            logger.info("Detected %d warm candidate(s) for memory %s", len(warm), memory_id)
+
+        return {"hot": hot, "warm": warm, "llm_invoked": False}
+
+    def check_contradictions_candidates(
+        self,
+        memory_id: str,
+        hot_threshold: float = 0.90,
+        warm_threshold: float = 0.75,
+        limit: int = 10,
+    ) -> dict:
+        """Dry-run contradiction check for an existing memory — no links created (Fix 8).
+
+        Useful for Lab Manager triage and retrospective auditing.
+        """
+        if self.embedding_manager is None:
+            return {"error": "Embeddings disabled; cannot check contradictions.", "candidates": []}
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id, content, memory_type, agent_id, embedding FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            raise MemoryNotFoundError(memory_id)
+        if row["embedding"] is None:
+            return {"error": "Memory has no embedding.", "candidates": []}
+        if row["memory_type"] != "semantic":
+            return {"error": "Contradiction checking only applies to semantic memories.", "candidates": []}
+
+        embedding = self.embedding_manager.deserialize_embedding(row["embedding"])
+        content = row["content"]
+        agent_id = row["agent_id"]
+
+        conn = self._connect()
+        try:
+            pool_a = self._fetch_embedding_candidates(
+                conn, memory_id, "semantic", agent_id, limit * 3
             )
-        return contradictions
+            pool_b: list[dict] = []
+            if agent_id is not None:
+                pool_b = self._fetch_cross_agent_candidates(
+                    conn, memory_id, content, "semantic", agent_id, limit
+                )
+        finally:
+            conn.close()
+
+        all_candidates = pool_a + pool_b
+        if not all_candidates:
+            return {"candidates": []}
+
+        corpus = np.array([
+            self.embedding_manager.deserialize_embedding(r["embedding"])
+            for r in all_candidates
+        ])
+        similarities = self.embedding_manager.cosine_similarity(embedding, corpus)
+
+        results = []
+        for i, cand in enumerate(all_candidates):
+            sim = float(similarities[i])
+            if sim >= warm_threshold:
+                zone = "hot" if sim >= hot_threshold else "warm"
+                results.append({
+                    "memory_id": cand["id"],
+                    "similarity": round(sim, 4),
+                    "zone": zone,
+                    "content_preview": cand["content"][:150],
+                    "version": cand["version"],
+                    "cross_agent": cand.get("_cross_agent", False),
+                })
+
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return {"candidates": results[:limit]}
 
     # --- Link operations ---
 

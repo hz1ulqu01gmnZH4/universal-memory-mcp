@@ -64,6 +64,7 @@ class HybridSearch:
         min_importance: float = 0.0,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        exclude_superseded: bool = True,
     ) -> list[dict[str, Any]]:
         """Execute a search with the specified mode.
 
@@ -91,6 +92,7 @@ class HybridSearch:
             "min_importance": min_importance,
             "time_start": time_start,
             "time_end": time_end,
+            "exclude_superseded": exclude_superseded,
         }
 
         if mode == "keyword":
@@ -171,6 +173,8 @@ class HybridSearch:
         if filters.get("time_end"):
             clauses.append(f"{table_alias}.created_at <= ?")
             params.append(filters["time_end"])
+        if filters.get("exclude_superseded", True):
+            clauses.append(f"{table_alias}.superseded_by IS NULL")
 
         sql = (" AND " + " AND ".join(clauses)) if clauses else ""
         return sql, params

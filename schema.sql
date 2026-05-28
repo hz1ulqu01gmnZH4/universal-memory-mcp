@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS memories (
     version INTEGER NOT NULL DEFAULT 1,
     importance REAL NOT NULL DEFAULT 0.5 CHECK(importance >= 0.0 AND importance <= 1.0),
     access_count INTEGER NOT NULL DEFAULT 0,
-    last_accessed_at TEXT
+    last_accessed_at TEXT,
+    superseded_by TEXT REFERENCES memories(id) ON DELETE SET NULL
 );
 
 -- FTS5 virtual table for keyword search (porter stemming + unicode)

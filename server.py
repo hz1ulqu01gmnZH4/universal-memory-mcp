@@ -151,6 +151,10 @@ def recall_memories(
         Optional[str],
         Field(description="ISO8601 end time filter."),
     ] = None,
+    exclude_superseded: Annotated[
+        bool,
+        Field(description="Exclude memories marked as superseded by a newer version. Default True."),
+    ] = True,
 ) -> list[dict[str, Any]]:
     """Search memories using hybrid keyword+semantic search with filters."""
     return searcher.search(
@@ -163,6 +167,7 @@ def recall_memories(
         min_importance=min_importance,
         time_start=time_start,
         time_end=time_end,
+        exclude_superseded=exclude_superseded,
     )
 
 
@@ -230,6 +235,41 @@ def delete_memory(
     """Delete a memory and all its graph links."""
     try:
         return store.delete_memory(memory_id)
+    except MemoryNotFoundError as e:
+        return {"error": str(e)}
+
+
+# --- Contradiction Tools ---
+
+
+@mcp.tool()
+def check_contradictions(
+    memory_id: Annotated[str, Field(description="UUID of the memory to check for contradictions")],
+    hot_threshold: Annotated[
+        float,
+        Field(description="Similarity threshold for hot-zone (auto-link) candidates. Default 0.90.", ge=0.0, le=1.0),
+    ] = 0.90,
+    warm_threshold: Annotated[
+        float,
+        Field(description="Similarity threshold for warm-zone (surface only) candidates. Default 0.75.", ge=0.0, le=1.0),
+    ] = 0.75,
+    limit: Annotated[
+        int,
+        Field(description="Maximum candidates to return.", ge=1, le=50),
+    ] = 10,
+) -> dict[str, Any]:
+    """Dry-run contradiction check for an existing memory. Returns candidates without creating any links.
+
+    Use for triage ('does this memory conflict with anything?') and auditing correction chains.
+    To include superseded memories in the audit, call recall_memories with exclude_superseded=False.
+    """
+    try:
+        return store.check_contradictions_candidates(
+            memory_id=memory_id,
+            hot_threshold=hot_threshold,
+            warm_threshold=warm_threshold,
+            limit=limit,
+        )
     except MemoryNotFoundError as e:
         return {"error": str(e)}
 
